@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Solver logs and outputs
+*.log
+*.lp
+*.mps
+*.sol
+results/*
+!results/.gitkeep
+solution_*/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
