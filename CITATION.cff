@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the article below."
+title: "Collaborative routing orchestration for organic food distribution (companion code)"
+authors:
+  - family-names: Ocampo-Giraldo
+    given-names: Daniel
+  - family-names: Anaya-Arenas
+    given-names: Ana María
+  - family-names: Klibi
+    given-names: Walid
+  - family-names: Ortmann
+    given-names: Janosch
+license: MIT
+repository-code: "https://github.com/janoschortmann/orchestration-organic-food"
+preferred-citation:
+  type: article
+  title: "Collaborative routing orchestration for organic food distribution"
+  authors:
+    - family-names: Ocampo-Giraldo
+      given-names: Daniel
+    - family-names: Anaya-Arenas
+      given-names: Ana María
+    - family-names: Klibi
+      given-names: Walid
+    - family-names: Ortmann
+      given-names: Janosch
+  journal: "Transportation Research Part E: Logistics and Transportation Review"
+  volume: 214
+  start: 105060
+  year: 2026
+  doi: "10.1016/j.tre.2026.105060"
