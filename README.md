@@ -1,70 +1,81 @@
-# Collaborative Routing Orchestration for Organic Food Distribution
+# CRO-FDP: Relax-Solve-and-Fix (corrected implementation)
 
-Companion code for the article:
+Corrected implementation of the solution method of
 
 > Ocampo-Giraldo, D., Anaya-Arenas, A. M., Klibi, W., & Ortmann, J. (2026).
 > Collaborative routing orchestration for organic food distribution.
-> *Transportation Research Part E: Logistics and Transportation Review*, 214, 105060.
-> https://doi.org/10.1016/j.tre.2026.105060
+> *Transportation Research Part E*, 214, 105060. https://doi.org/10.1016/j.tre.2026.105060
 
-> **Status:** this repository is being organized. The code below is the research code used for the article, uploaded as-is. A cleaner structure, documentation and tests will follow.
+used as a benchmark for the logic-based Benders decomposition of
+[vtsp-lbbd](https://github.com/dmocampog/vtsp-lbbd) (article 3). The changes will be
+merged into the article's public repository (`janoschortmann/orchestration-organic-food`).
 
-## The problem
+## Method (Algorithm 1 of the article)
 
-Several small producers share their delivery operations. Each request must be picked up at an origin and delivered to a destination within a time window. Producers can coordinate routes and use shared transfer hubs, where loads are exchanged between vehicles. The goal is to decide which hubs to open and how vehicles are routed and synchronized, minimizing hub, vehicle and routing costs.
+`src/pipeline.py` runs the stages within a total time budget (`--total-time`):
 
-The models are formulated on time-expanded networks and solved with Gurobi through Pyomo.
+0. **RGCH** on the original commodities (`src/rgch.py`): first upper bound; it also bounds
+   the fleet of the relaxation, (UB - routing lower bound) / vehicle cost.
+1. **Interval-based relaxation** (`src/interval_relaxation.py`): lower bound.
+2. **Feasibility LP** (B.4–B.10, `src/feasibility.py`): if the relaxed routes can be
+   scheduled, they are a solution with cost = LB, so it is optimal.
+3. **RGCH on the split commodities**: legs o → hub → d with the time window split evenly.
+4. **RUBS** (`src/rubs.py`): TE model on a 60-min grid restricted to the relaxed arcs and the
+   hub arcs, with conservative rounding.
 
-## Repository structure
+UB = best candidate. Every candidate is checked by `src/solution.py` (times, windows, transfers
+at hubs, working time, capacity) and its cost is recomputed from the routes.
 
-```
-orchestration-organic-food/
-├── src/            research code (see below)
-├── instances/      instance files (see instances/README.md)
-├── experiments/    scripts to reproduce the article's results (to come)
-├── results/        output folder (not tracked)
-├── requirements.txt
-└── CITATION.cff
-```
+## Differences with the published code
 
-### Main files in `src/`
+- Vehicle capacity is optional (`--capacity none`, the setting of article 3).
+- Exact travel times in the relaxation, so the lower bound is valid for the
+  continuous-time problem.
+- A commodity may wait at its origin, destination and hubs (constraint 31 of the TE model).
+- The relaxed solution is checked with the LP of Appendix B; the split commodities are built
+  correctly (several hubs allowed); RUBS imposes the constraints it declares; the best
+  solution is verified and saved.
+- Fleet size, costs and time limits are parameters; one JSON per run in `results/<tag>/`.
+- Instances: the 100 public instances in `instances/` (same files as vtsp-lbbd: anonymous
+  ids, no locations, shortest-path matrices), read by column name, with the same cost and
+  time conventions as the LBBD (`ceil(2 * distance)`, minutes). See `instances/README.md`.
 
-| File | What it does |
-| --- | --- |
-| `data.py` | Reads instances and solutions (`load_data`, `data_read`, `sol_read`, `DataContainer`, `SolContainer`) and provides travel-time and cost helpers (`tt`, `cc`). Solution readers were reconstructed and should be checked against the original runs. |
-| `ofndp_mips.py` | Interval-based time-expanded MIP (`ofndp_int`), with subtour-elimination lazy cuts via a Gurobi callback. Gives a lower bound. |
-| `mip_dt_3.py` | Fully time-expanded MIP (`mip_e_solution`), optionally restricted to the arcs of a given solution. |
-| `mipc.py` | Compact (non time-expanded) MIP with big-M synchronization at hubs, used as a benchmark. Reads a different instance format. |
-| `FCheck.py` | Feasibility check (`FS_Check`): verifies that a solution can be scheduled in time, including synchronization at hubs. |
-| `RGCH.py` | Randomized greedy construction heuristic (`rgch`) based on cheapest insertion, with time-window and capacity checks. Can be run on its own: `python RGCH.py --instance_id 2`. |
-| `int_end.py` | Main pipeline: heuristic, interval MIP, feasibility check and repair. Writes a summary CSV. |
-| `solution_ub.py`, `solution_ub2.py` | Compute upper bounds by re-solving restricted models from a lower-bound solution. |
-
-## Requirements
-
-- Python 3.10+
-- Gurobi with a valid license (free academic licenses are available from Gurobi)
-- Python packages in `requirements.txt`
+## Setup
 
 ```bash
+conda env create -f environment.yml
+conda activate cro-fdp-rsf
+```
+
+Without conda (e.g. on the cluster), a virtual environment in the repository works too:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Running an instance
+Gurobi needs a licence (`grbgetkey` or a `gurobi.lic` file); HiGHS works without one.
 
-From the `src/` folder:
+## Running
 
 ```bash
-cd src
-python int_end.py
+python scripts/run_rsf.py --instance 6 --tag test --total-time 600
+python scripts/run_rsf.py --instance 2 --tag test --solver highs --total-time 120   # without Gurobi
+pytest -q
+python scripts/summarize_results.py --tags test
 ```
 
-Instance and output paths, and the instance id, are currently set at the top of each script. Command-line arguments and a configuration file will be added.
+Experiments on the cluster (total time 3 h, 6 h and 9 h per instance). The jobs inherit the
+environment of the shell that submits them:
 
-## Citation
+```bash
+source .venv/bin/activate
+module load gurobi/<version>              # the modules used on the server
+bash scripts/slurm/smoke.sh               # instances 2 and 6, 10 min each
+bash scripts/slurm/submit_experiments.sh  # rsf_3h, rsf_6h, rsf_9h
+python scripts/summarize_results.py --tags rsf_3h rsf_6h rsf_9h
+```
 
-If you use this code, please cite the article above. GitHub's "Cite this repository" button uses `CITATION.cff`.
-
-## License
-
-MIT License. See `LICENSE`.
+Instances are read from `instances/` (or `--folder`).

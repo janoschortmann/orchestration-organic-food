@@ -1,5 +1,7 @@
-pyomo
-gurobipy
+pyomo>=6.7
+gurobipy==13.*
 numpy
 pandas
 networkx
+highspy
+pytest

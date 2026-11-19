@@ -1,0 +1,14 @@
+name: cro-fdp-rsf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pandas
+  - networkx
+  - pyomo>=6.7
+  - pytest
+  - pip:
+      - gurobipy==13.*
+      - highspy

@@ -1,11 +1,21 @@
-# Instances
+# VTSP instances (cbl_1 ... cbl_100)
 
-Each instance is a single CSV file (`cbl_<id>.csv`) made of five blocks, one after the other:
+One CSV file per instance, `cbl_<id>.csv`, plus `instances.csv` (one row per instance:
+size class, number of commodities, nodes, origins, destinations and hubs).
 
-1. **Size:** number of requests `k` and number of nodes `n`.
-2. **Requests** (one row per request): origin node `oid`, destination node `did`, quantity `nk`, direct distance `d`, direct travel time `tt`, earliest pickup time `l` and latest delivery time `u` (minutes).
-3. **Nodes:** latitude, longitude, member id, type (`O` origin, `D` destination, `H` hub) and node id.
-4. **Distance matrix** between nodes.
-5. **Travel-time matrix** between nodes (minutes).
+## File layout
 
-> Instance files will be added here once it is confirmed which data can be shared publicly. Anonymized or synthetic instances will be provided if the original data cannot be published.
+1. `k,n,type`: number of commodities, number of nodes and size class
+   (`s` = small, `m` = medium, `l` = large).
+2. Commodity table: `oid, did, nk, d, tt, l, u` (origin node, destination node,
+   quantity, direct distance and travel time origin -> destination, time window [l, u]).
+3. Node table: `Member, Type, n_id` (Type: `O` origin, `D` destination, `H` hub).
+4. Distance matrix (`id` row and column headers are node ids).
+5. Travel-time matrix, in minutes.
+
+## Notes
+
+- Node and member ids are anonymous; a node keeps the same id in every instance.
+  Locations have been removed.
+- Distances and travel times are shortest-path values (metric closure), so both
+  matrices satisfy the triangle inequality.

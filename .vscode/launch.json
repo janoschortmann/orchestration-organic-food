@@ -1,0 +1,63 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "RSF: instance 6 (Gurobi, 600 s)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rsf.py",
+      "args": [
+        "--instance",
+        "6",
+        "--tag",
+        "test",
+        "--total-time",
+        "600"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "RSF: instance 2 (HiGHS, no licence)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_rsf.py",
+      "args": [
+        "--instance",
+        "2",
+        "--tag",
+        "test",
+        "--solver",
+        "highs",
+        "--total-time",
+        "120"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Summarize results",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/summarize_results.py",
+      "args": [
+        "--tags",
+        "test"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    }
+  ]
+}

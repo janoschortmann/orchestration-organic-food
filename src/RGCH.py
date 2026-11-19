@@ -1,505 +1,210 @@
-import numpy as np
+"""
+Randomised greedy constructive heuristic (article 2, Section 4.3.3 and Appendix C).
+
+Each request is a pickup-and-delivery pair (origin, destination, quantity, release, due).
+A route is started with a random request; then the request with the cheapest feasible
+insertion (random among the `rcl` cheapest) is inserted, until none fits; then a new
+route is started. Insertion feasibility uses forward time slacks (Savelsbergh, 1992;
+Masson et al., 2013), so each test is O(1) after an O(n) update of the route.
+
+Feasibility of a route: service at a pickup not before the release time, service at a
+delivery not after the due time, travel time <= working time, and (optional) capacity.
+There is no service time; the depot has zero travel time and cost.
+
+Split commodities (`split_requests`): a commodity that went through hubs h1, ..., hm in
+the relaxed solution becomes m + 1 requests o -> h1 -> ... -> d, and its time window is
+divided in equal parts. Leg i is delivered at the hub before leg i + 1 is released, so
+the legs are synchronised whatever routes serve them.
+"""
+import random
 import time
-from data import cc, tt
-np.float_ = np.float64
-import os
-import csv
+from dataclasses import dataclass
+
+INF = float('inf')
+
+
+@dataclass
+class Request:
+    rid: int
+    k: int            # original commodity
+    leg: int          # position in the commodity's chain
+    o: int
+    d: int
+    q: float
+    release: float
+    due: float
+
+
+def requests_from_instance(inst, hub_seqs=None):
+    """One request per commodity, or one per leg if `hub_seqs[k]` lists hubs to go through."""
+    reqs = []
+    for k, row in inst.k.iterrows():
+        stops = [int(row.oid)] + list((hub_seqs or {}).get(k, [])) + [int(row.did)]
+        l, u = float(row.l), float(row.u)
+        n = len(stops) - 1
+        width = (u - l) / n
+        legs = [(stops[i], stops[i + 1], l + i * width, l + (i + 1) * width) for i in range(n)]
+        if n > 1 and any(a == b or r + inst.tau(a, b) > dd for a, b, r, dd in legs):
+            legs = [(int(row.oid), int(row.did), l, u)]      # the split does not fit: keep k whole
+        for i, (a, b, r, dd) in enumerate(legs):
+            reqs.append(Request(len(reqs), k, i, a, b, float(row.nk), r, dd))
+    return reqs
 
 
 class Route:
-    """
-    Represents a route with pickup and delivery locations, timing, and distance information.
-    """
+    def __init__(self, inst, working_time, capacity):
+        self.inst, self.W, self.Q = inst, working_time, capacity
+        self.stops = []           # (node, request, is_pickup)
+        self.update()
 
-    def __init__(self):
-        self.nodes = []  # List of node IDs (pickup/delivery locations)
-        self.requests = []  # List of request IDs (corresponding to k in original code)
-        self.distance = 0  # Total distance of the route
-        self.duration = 0  # Total duration of the route
-        self.service_times = []  # List of service times at each node
-        self.waiting_times = []  # List of waiting times at each node
-        self.slacks = []  # List of slacks at each node
-        self.pickup_delivery = []  # List of 'p' for pickup and 'd' for delivery
-        self.capacity_slacks = [] # list of capacity slacks at each node
+    # --- route data -------------------------------------------------------------
+    def earliest(self, stop):
+        return stop[1].release if stop[2] else 0.0
 
-    def insert(self, request_id, insert_pickup_at, insert_delivery_at, data, dt):
-        """
-        Inserts a pickup and delivery pair into the route.
+    def latest(self, stop):
+        r = stop[1]
+        return r.due - self.inst.tau(r.o, r.d) if stop[2] else r.due
 
-        Args:
-            request_id: The ID of the request to insert.
-            insert_pickup_at: The index where the pickup node should be inserted.
-            insert_delivery_at: The index where the delivery node should be inserted.
-            data: The data object containing problem information.
-            dt: Time-related parameter.
-        """
-        pickup_node = data.k.loc[request_id].oid
-        delivery_node = data.k.loc[request_id].did
+    def update(self):
+        n, tau = len(self.stops), self.inst.tau
+        self.S, self.wait, self.load = [0.0] * n, [0.0] * n, [0.0] * n
+        self.travel, self.cost = 0.0, 0.0
+        for i, st in enumerate(self.stops):
+            arrive = self.earliest(st) if i == 0 else self.S[i - 1] + tau(self.stops[i - 1][0], st[0])
+            self.S[i] = max(arrive, self.earliest(st))
+            self.wait[i] = self.S[i] - arrive
+            if i > 0:
+                self.travel += tau(self.stops[i - 1][0], st[0])
+                self.cost += self.inst.c(self.stops[i - 1][0], st[0])
+            self.load[i] = (self.load[i - 1] if i else 0.0) + (st[1].q if st[2] else -st[1].q)
+        self.F = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            own = self.latest(self.stops[i]) - self.S[i]
+            self.F[i] = own if i == n - 1 else min(own, self.wait[i + 1] + self.F[i + 1])
 
-        if insert_delivery_at == insert_pickup_at + 1:
-            self.nodes.insert(insert_pickup_at, pickup_node)
-            self.nodes.insert(insert_delivery_at, delivery_node)
-            self.requests.insert(insert_pickup_at, request_id)
-            self.requests.insert(insert_delivery_at, request_id)
-            self.pickup_delivery.insert(insert_pickup_at, 'p')
-            self.pickup_delivery.insert(insert_delivery_at, 'd')
+    def _arrival_delay(self, j, start_prev, node_prev):
+        """Delay at old stop j when its predecessor becomes `node_prev` served at `start_prev`."""
+        st = self.stops[j]
+        new_start = max(start_prev + self.inst.tau(node_prev, st[0]), self.earliest(st))
+        return max(0.0, new_start - self.S[j])
 
-        else:
-            self.nodes.insert(insert_pickup_at, pickup_node)
-            self.nodes.insert(insert_delivery_at + 1, delivery_node)
-            self.requests.insert(insert_pickup_at, request_id)
-            self.requests.insert(insert_delivery_at + 1, request_id)
-            self.pickup_delivery.insert(insert_pickup_at, 'p')
-            self.pickup_delivery.insert(insert_delivery_at + 1, 'd')
+    # --- insertion ----------------------------------------------------------------
+    def best_insertion(self, r):
+        """(extra cost, i, j): pickup before old stop i, delivery before old stop j (j >= i)."""
+        tau, c, n = self.inst.tau, self.inst.c, len(self.stops)
+        best = (INF, None, None)
+        if self.Q is not None and r.q > self.Q:
+            return best
+        for i in range(n + 1):
+            prev = self.stops[i - 1] if i > 0 else None
+            sp = r.release if prev is None else max(self.S[i - 1] + tau(prev[0], r.o), r.release)
+            if sp > r.due - tau(r.o, r.d):
+                if prev is not None and self.S[i - 1] > r.due:
+                    break
+                continue
+            # delivery right after the pickup
+            sd = sp + tau(r.o, r.d)
+            if sd <= r.due:
+                extra_t = tau(r.o, r.d) + (tau(prev[0], r.o) if prev else 0)
+                extra_c = c(r.o, r.d) + (c(prev[0], r.o) if prev else 0)
+                if i < n:
+                    extra_t += tau(r.d, self.stops[i][0]) - (tau(prev[0], self.stops[i][0]) if prev else 0)
+                    extra_c += c(r.d, self.stops[i][0]) - (c(prev[0], self.stops[i][0]) if prev else 0)
+                ok = self.travel + extra_t <= self.W + 1e-9
+                if ok and i < n:
+                    ok = self._arrival_delay(i, sd, r.d) <= self.F[i] + 1e-9
+                if ok and self.Q is not None:
+                    ok = (self.load[i - 1] if i > 0 else 0.0) + r.q <= self.Q
+                if ok and extra_c < best[0]:
+                    best = (extra_c, i, i)
+            if i == n:
+                continue
+            # delivery later: walk the delay of the pickup through stops i, i+1, ...
+            delay = self._arrival_delay(i, sp, r.o)
+            add_t = tau(r.o, self.stops[i][0]) + (tau(prev[0], r.o) - tau(prev[0], self.stops[i][0]) if prev else 0)
+            add_c = c(r.o, self.stops[i][0]) + (c(prev[0], r.o) - c(prev[0], self.stops[i][0]) if prev else 0)
+            max_load = (self.load[i - 1] if i > 0 else 0.0)
+            for j in range(i + 1, n + 1):
+                pj = self.stops[j - 1]
+                if self.S[j - 1] + delay > self.latest(pj) + 1e-9:
+                    break                                   # stop j-1 is late: later j are worse
+                max_load = max(max_load, self.load[j - 1])
+                if self.Q is not None and max_load + r.q > self.Q + 1e-9:
+                    break
+                sd = self.S[j - 1] + delay + tau(pj[0], r.d)
+                if sd <= r.due:
+                    t2 = tau(pj[0], r.d) + (tau(r.d, self.stops[j][0]) - tau(pj[0], self.stops[j][0]) if j < n else 0)
+                    c2 = c(pj[0], r.d) + (c(r.d, self.stops[j][0]) - c(pj[0], self.stops[j][0]) if j < n else 0)
+                    ok = self.travel + add_t + t2 <= self.W + 1e-9
+                    if ok and j < n:
+                        ok = self._arrival_delay(j, sd, r.d) <= self.F[j] + 1e-9
+                    if ok and add_c + c2 < best[0]:
+                        best = (add_c + c2, i, j)
+                if j < n:                                   # delay carried to stop j
+                    delay = max(0.0, delay - self.wait[j]) if delay > 0 else 0.0
+        return best
 
-        self.service_times = self.calculate_service_times(data, dt)
-        self.waiting_times = self.calculate_waiting_times(data, dt)
-        self.distance = self.calculate_distance(data)
-        self.duration = self.calculate_duration(data, dt)
-        self.slacks = self.calculate_slack(data)
-        self.capacity_slacks = self.calculate_capacity_slack(data)
-
-    def calculate_service_times(self, data, dt):
-        """Calculates the service time at each node."""
-        service_times = [data.k.loc[self.requests[0]].l]
-        for i in range(1, len(self.requests)):
-            service_times.append(
-                max(
-                    data.k.loc[self.requests[i]].l,
-                    service_times[i - 1]
-                    + tt(self.nodes[i - 1], self.nodes[i], data.tt_m, dt),
-                )
-            )
-        return service_times
-
-    def calculate_waiting_times(self, data, dt):
-        """Calculates the waiting time at each node."""
-        waiting_times = [0]
-        for i in range(1, len(self.requests)):
-            waiting_times.append(
-                max(
-                    0,
-                    data.k.loc[self.requests[i]].l
-                    - (
-                            self.service_times[i - 1]
-                            + tt(self.nodes[i - 1], self.nodes[i], data.tt_m, dt)
-                    ),
-                )
-            )
-        return waiting_times
-
-    def calculate_distance(self, data):
-        """Calculates the total distance of the route."""
-        distance = 0
-        for i in range(1, len(self.nodes)):
-            distance += cc(self.nodes[i - 1], self.nodes[i], data.d_m)
-        return distance
-
-    def calculate_duration(self, data, dt):
-        """Calculates the total duration of the route."""
-        duration = 0
-        for i in range(1, len(self.nodes)):
-            duration += tt(self.nodes[i - 1], self.nodes[i], data.tt_m, dt)
-        return duration + sum(self.waiting_times)
-
-    def calculate_slack(self, data):
-        """Calculates the slack at each node."""
-        slacks = [0] * len(self.requests)
-        slacks[-1] = max(
-            data.k.loc[self.requests[-1]].u
-            - self.service_times[-1]
-            + self.waiting_times[-1],
-            0,
-        )
-        for i in range(len(slacks) - 2, -1, -1):
-            forward_slack = slacks[i + 1]
-            local_slack = (
-                    data.k.loc[self.requests[i]].u
-                    - self.service_times[i]
-                    + self.waiting_times[i]
-            )
-            slacks[i] = max(min(local_slack, forward_slack), 0)
-        return slacks
-    def calculate_capacity_slack(self,data):
-        capacity_slack = []
-        for i in range(len(self.requests)):
-            if i == 0:
-                capacity_slack.append(100)
-            else:
-                if self.pickup_delivery[i-1] == 'd':
-                    demand = -1*data.k.loc[self.requests[i-1]].nk
-                else:
-                    demand = data.k.loc[self.requests[i-1]].nk
-                capacity_slack.append(capacity_slack[i-1] - demand)
-        return capacity_slack
-
-    def evaluate_insert(self, request_id, insert_pickup_at, insert_delivery_at, data, dt):
-        """
-        Evaluates if a request can be inserted at the given positions.
-        Returns the slack increase if possible, -1 otherwise.
-        """
-        pickup_node = data.k.loc[request_id].oid
-        delivery_node = data.k.loc[request_id].did
-        lower_time_window = data.k.loc[request_id].l
-        upper_time_window = data.k.loc[request_id].u
-
-        if insert_pickup_at > len(self.requests):
-            return -1
-
-        if insert_pickup_at == len(self.requests):
-            service_pickup = max(
-                self.service_times[insert_pickup_at - 1]
-                + tt(self.nodes[insert_pickup_at - 1], pickup_node, data.tt_m, dt),
-                lower_time_window,
-            )
-            service_delivery = max(
-                service_pickup + tt(pickup_node, delivery_node, data.tt_m, dt),
-                lower_time_window,
-            )
-            if service_pickup > upper_time_window or service_delivery > upper_time_window:
-                return -1
-            else:
-                return 0
-
-        # Evaluate capacity
-        if insert_delivery_at != 1:
-            vehicle_capacity = min(self.capacity_slacks[insert_pickup_at:insert_delivery_at])
-            if vehicle_capacity < data.k.loc[request_id].nk:
-                return -1
-
-        if insert_pickup_at == 0:
-            service_pickup = lower_time_window
-        else:
-            service_pickup = max(
-                self.service_times[insert_pickup_at - 1]
-                + tt(self.nodes[insert_pickup_at - 1], pickup_node, data.tt_m, dt),
-                lower_time_window,
-            )
-
-        if service_pickup > upper_time_window:
-            return -1
-
-        if insert_delivery_at == insert_pickup_at + 1:
-            service_delivery = max(
-                service_pickup + tt(pickup_node, delivery_node, data.tt_m, dt),
-                lower_time_window,
-            )
-            if service_delivery > upper_time_window:
-                return -1
-            time_shift = max(
-                0,
-                service_delivery
-                + tt(delivery_node, self.nodes[insert_pickup_at], data.tt_m, dt)
-                - self.service_times[insert_pickup_at],
-            )
-            if time_shift > self.slacks[insert_pickup_at]:
-                return -1
-            else:
-                return time_shift
-
-        time_shift = max(
-            0,
-            service_pickup
-            + tt(pickup_node, self.nodes[insert_pickup_at], data.tt_m, dt)
-            - self.service_times[insert_pickup_at],
-        )
-
-        if time_shift > self.slacks[insert_pickup_at]:
-            return -1
-
-        if insert_delivery_at == len(self.requests):
-            service_delivery = max(
-                time_shift
-                + self.service_times[insert_delivery_at - 1]
-                + tt(self.nodes[insert_delivery_at - 1], delivery_node, data.tt_m, dt),
-                lower_time_window,
-            )
-            if service_delivery > upper_time_window:
-                return -1
-            else:
-                return time_shift
-
-        service_delivery = max(
-            time_shift
-            + self.service_times[insert_delivery_at - 1]
-            + tt(self.nodes[insert_delivery_at - 1], delivery_node, data.tt_m, dt),
-            lower_time_window,
-        )
-        if service_delivery > upper_time_window:
-            return -1
-
-        time_shift2 = max(
-            0,
-            service_delivery
-            + tt(delivery_node, self.nodes[insert_delivery_at], data.tt_m, dt)
-            - self.service_times[insert_delivery_at],
-        )
-        if time_shift2 > self.slacks[insert_delivery_at]:
-            return -1
-
-        return time_shift + time_shift2
-
-    def evaluate_cost(self, request_id, insert_pickup_at, insert_delivery_at, data, dt):
-        """Evaluates the cost of inserting a request at given positions."""
-        if self.evaluate_insert(
-                request_id, insert_pickup_at, insert_delivery_at, data, dt
-        ) == -1:
-            return np.inf
-
-        pickup_node = data.k.loc[request_id].oid
-        delivery_node = data.k.loc[request_id].did
-
-        if insert_pickup_at == len(self.requests):
-            return cc(
-                self.nodes[insert_pickup_at - 1], pickup_node, data.d_m
-            ) + cc(pickup_node, delivery_node, data.d_m)
-
-        if insert_pickup_at == 0:
-            if insert_delivery_at == insert_pickup_at + 1:
-                return cc(pickup_node, delivery_node, data.d_m) + cc(
-                    delivery_node, self.nodes[insert_pickup_at], data.d_m
-                )
-            elif insert_delivery_at == len(self.requests):
-                return cc(pickup_node, self.nodes[insert_pickup_at], data.d_m) + cc(
-                    self.nodes[insert_delivery_at - 1], delivery_node, data.d_m
-                )
-            else:
-                return cc(pickup_node, self.nodes[insert_pickup_at], data.d_m) + cc(
-                    self.nodes[insert_delivery_at - 1], delivery_node, data.d_m
-                ) + cc(
-                    delivery_node, self.nodes[insert_delivery_at], data.d_m
-                ) - cc(
-                    self.nodes[insert_delivery_at - 1],
-                    self.nodes[insert_delivery_at],
-                    data.d_m,
-                )
-
-        else:
-            if insert_delivery_at == insert_pickup_at + 1:
-                return cc(
-                    self.nodes[insert_pickup_at - 1], pickup_node, data.d_m
-                ) + cc(pickup_node, delivery_node, data.d_m) + cc(
-                    delivery_node, self.nodes[insert_pickup_at], data.d_m
-                ) - cc(
-                    self.nodes[insert_pickup_at - 1],
-                    self.nodes[insert_pickup_at],
-                    data.d_m,
-                )
-            elif insert_delivery_at == len(self.requests):
-                return cc(
-                    self.nodes[insert_pickup_at - 1], pickup_node, data.d_m
-                ) + cc(pickup_node, self.nodes[insert_pickup_at], data.d_m) + cc(
-                    self.nodes[insert_delivery_at - 1], delivery_node, data.d_m
-                ) - cc(
-                    self.nodes[insert_pickup_at - 1],
-                    self.nodes[insert_pickup_at],
-                    data.d_m,
-                )
-            else:
-                return cc(
-                    self.nodes[insert_pickup_at - 1], pickup_node, data.d_m
-                ) + cc(pickup_node, self.nodes[insert_pickup_at], data.d_m) + cc(
-                    self.nodes[insert_delivery_at - 1], delivery_node, data.d_m
-                ) + cc(
-                    delivery_node, self.nodes[insert_delivery_at], data.d_m
-                ) - cc(
-                    self.nodes[insert_pickup_at - 1],
-                    self.nodes[insert_pickup_at],
-                    data.d_m,
-                ) - cc(
-                    self.nodes[insert_delivery_at - 1],
-                    self.nodes[insert_delivery_at],
-                    data.d_m,
-                )
-
-    def find_best_insert(self, request_id, data, dt):
-        """
-        Finds the best place to insert a request into the route.
-
-        Returns:
-            A list [best_cost, request_id, best_pickup_index, best_delivery_index]
-            or [] if no valid insertion is found.
-        """
-        insert_options = []
-        for pickup_index in range(len(self.requests) + 1):
-            for delivery_index in range(pickup_index + 1, len(self.requests) + 2):
-                if pickup_index < len(self.requests) and delivery_index > len(self.requests):
-                    continue
-                cost = self.evaluate_cost(
-                    request_id, pickup_index, delivery_index, data, dt
-                )
-                insert_options.append([cost, request_id, pickup_index, delivery_index])
-
-        insert_options.sort()
-
-        if len(insert_options) > 0:
-            return insert_options[0]
-        return []
+    def insert(self, r, i, j):
+        self.stops.insert(i, (r.o, r, True))
+        self.stops.insert(j + 1, (r.d, r, False))
+        self.update()
 
 
-def single_route_cost(k_index,data, dt):
-    """Constructs an initial solution using a greedy approach for a single route."""
-    request_ids = list(data.k.index)
-    route = Route()
-    route.insert(k_index, 0, 1, data, dt)
-    requests_to_insert = [k for k in request_ids if k != k_index]
-
-    while requests_to_insert:
-        best_inserts = [
-            route.find_best_insert(k, data, dt)
-            for k in requests_to_insert
-            if route.find_best_insert(k, data, dt)
-        ]
-
-        # Filter out inf values
-        valid_inserts = [insert for insert in best_inserts if insert[0] != np.inf]
-
-        if valid_inserts:
-            valid_inserts.sort(key=lambda x: x[0])
-            best_insert = valid_inserts[0]
-            route.insert(
-                best_insert[1], best_insert[2], best_insert[3], data, dt
-            )
-            requests_to_insert.remove(best_insert[1])
-        else:
-            break
-    cost = 0
-    for i in range(1, len(route.nodes)):
-        cost += cc(route.nodes[i - 1], route.nodes[i], data.d_m)
-    cost = cost/len(set(route.requests))
-    return cost
-
-def construct_solution(data, dt):
-    """Constructs an initial solution using a greedy randomized approach."""
-    # Use data.k.index directly for request IDs
-    request_ids = list(data.k.index)
-    kk = np.random.choice(request_ids)
-    routes = [Route()]
-    routes[0].insert(kk, 0, 1, data, dt)
-    requests_to_insert = [k for k in request_ids if k != kk]
-
-    while requests_to_insert:
-        best_inserts = [
-            routes[-1].find_best_insert(k, data, dt)
-            for k in requests_to_insert
-            if routes[-1].find_best_insert(k, data, dt)
-        ]
-
-        # Filter out inf values
-        valid_inserts = [insert for insert in best_inserts if insert[0] != np.inf]
-
-        if valid_inserts:
-            valid_inserts.sort(key=lambda x: x[0])
-            if len(valid_inserts) == 1:
-                best_insert = valid_inserts[0]
-            else:
-                best_insert = valid_inserts[
-                    np.random.choice(min(5, len(valid_inserts)))
-                ]
-            routes[-1].insert(
-                best_insert[1], best_insert[2], best_insert[3], data, dt
-            )
-            requests_to_insert.remove(best_insert[1])
-        else:
-            routes.append(Route())
-            kk = np.random.choice(requests_to_insert)
-            routes[-1].insert(kk, 0, 1, data, dt)
-            requests_to_insert.remove(kk)
-
+def construct(inst, reqs, working_time, capacity, rng, rcl=3):
+    todo = list(reqs)
+    rng.shuffle(todo)
+    routes = []
+    while todo:
+        route = Route(inst, working_time, capacity)
+        first = todo.pop(rng.randrange(len(todo)))
+        route.insert(first, 0, 0)
+        while todo:
+            options = []
+            for r in todo:
+                cost, i, j = route.best_insertion(r)
+                if i is not None:
+                    options.append((cost, r.rid, r, i, j))
+            if not options:
+                break
+            options.sort(key=lambda t: (t[0], t[1]))
+            _, _, r, i, j = options[rng.randrange(min(rcl, len(options)))]
+            route.insert(r, i, j)
+            todo.remove(r)
+        routes.append(route)
     return routes
 
 
-def calculate_solution_cost(solution, data):
-    """Calculates the total cost of a solution."""
-    cost = 0
-    for route in solution:
-        for i in range(1, len(route.nodes)):
-            cost += 2 * np.ceil(cc(route.nodes[i - 1], route.nodes[i], data.d_m))
-    return 500 * len(solution) + cost
+def to_solution(routes):
+    """Common solution format (see solution.py)."""
+    sol_routes, legs = {}, {}
+    for l, route in enumerate(routes):
+        visits, where = [], {}
+        for idx, (node, r, is_pick) in enumerate(route.stops):
+            arrive = route.S[idx] - route.wait[idx]
+            visits.append({'node': node, 'arrive': arrive, 'depart': route.S[idx]})
+            where[r.rid, is_pick] = idx
+        sol_routes[l] = visits
+        for node, r, is_pick in route.stops:
+            if is_pick:
+                legs.setdefault(r.k, []).append((r.leg, {'vehicle': l, 'pickup': where[r.rid, True],
+                                                         'drop': where[r.rid, False]}))
+    legs = {k: [leg for _, leg in sorted(chain, key=lambda t: t[0])] for k, chain in legs.items()}
+    return {'routes': sol_routes, 'legs': legs}
 
 
-def rgch(iterations, data, dt, time_limit=3600):
-    """
-    Runs the Randomized Greedy Construction Heuristic (RGCH).
-
-    Args:
-        iterations: The number of iterations to run.
-        data: The problem data.
-        dt: Time-related parameter (e.g., current time).
-
-    Returns:
-        A list containing the best solution found and its cost, sorted by cost (ascending).
-        Format : [best_cost, best_solution]
-    """
-    solutions = []
-    initial_time = time.time()
+def rgch(inst, reqs, working_time=480, capacity=None, iterations=50, time_limit=60, seed=0,
+         evaluate=None):
+    """Best of `iterations` randomised constructions. `evaluate(sol) -> (cost, errors)`."""
+    rng = random.Random(seed)
+    best, best_cost, t0, done = None, INF, time.time(), 0
     for _ in range(iterations):
-        solution = construct_solution(data, dt)
-        cost = calculate_solution_cost(solution, data)
-        solutions.append([cost, solution])
-        if time.time() - initial_time > time_limit:
+        sol = to_solution(construct(inst, reqs, working_time, capacity, rng))
+        cost, errors = evaluate(sol)
+        if errors:
+            raise RuntimeError(f'RGCH built an infeasible solution: {errors[:3]}')
+        if cost < best_cost:
+            best, best_cost = sol, cost
+        done += 1
+        if time.time() - t0 > time_limit:
             break
-
-    solutions.sort(key=lambda x: x[0])  # Sort by cost (ascending)
-    return solutions[0]  # Return only the best solution
-
-def save_log_to_csv(log_data, filepath):
-    """
-    Appends a dictionary of log data as a new row to a CSV file.
-    Creates the file and header if it doesn't exist.
-    """
-    # Define a superset of all possible headers to ensure consistency
-    fieldnames = [
-        'timestamp', 'instance_id', 'log_type',
-        'upper_bound', 'lower_bound', 'optimality_gap', 'wall_clock_time',
-        'with_solution'
-    ]
-
-    file_exists = os.path.isfile(filepath)
-
-    with open(filepath, 'a', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-
-        if not file_exists:
-            writer.writeheader()
-
-        writer.writerow(log_data)
-
-if __name__ == '__main__':
-    import argparse
-    from pathlib import Path
-    from data import load_data
-
-    # --- Define and Parse Script Parameters ---
-    results_logfile = "upper_bound_rgch_results.csv"
-
-    parser = argparse.ArgumentParser(
-        description="Obtain a valid solution for the OFNDP from the unrestricted decomposition approach",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument('--instance_id', type=str, default='2',
-                        help='The ID of the data instance to load (e.g., "1", "2").')
-    args = parser.parse_args()
-    instance_id = args.instance_id
-    overall_start_time = time.time()
-    script_dir = Path(__file__).resolve().parent
-    data_folder = script_dir / 'cbl_inst'
-    data = load_data(data_folder, instance_id)
-    rgch_solution = rgch(50, data, 15)
-    wall_clock_time = round(time.time() - overall_start_time, 2)
-    solution_summary = {
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'instance_id': instance_id,
-        'log_type': 'rgch',
-        'upper_bound': rgch_solution[0],
-        'lower_bound': np.nan,
-        'optimality_gap': np.nan,
-        'wall_clock_time': wall_clock_time,
-        'with_solution': True
-    }
-    print("\n" + "=" * 40 + "\n")
-    print("--- Randomized Greedy Construction Heuristic Solution ---\n")
-    for name, value in solution_summary.items():
-        print(f"{name}: {value}")
-    print("\n" + "=" * 40 + "\n")
-    save_log_to_csv(solution_summary, results_logfile)
+    return best, best_cost, done
